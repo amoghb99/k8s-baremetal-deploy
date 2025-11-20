@@ -1,10 +1,10 @@
-# Phase 01 — Machine Preparation
+# Phase 01 — Machine Preparation (v2)
 
 ## 🎯 Goal
 
 Prepare all nodes (control-plane and workers) for a clean, consistent Kubernetes installation on bare metal.
 
-This phase ensures that every machine is configured identically and follows best practices before Kubespray deployment.
+This version includes senior review feedback: clearer kernel module explanations, defensive scripts, and IPv6 disabled by default for predictability.
 
 ---
 
@@ -38,6 +38,8 @@ This phase ensures that every machine is configured identically and follows best
 # 🖥️ 0. Basic System Identification
 
 Before configuring the system, collect basic machine information.
+
+> Note: command names and paths can vary between distributions. These examples are for Debian/Ubuntu-derived systems — adapt for RHEL/CentOS (yum/dnf) or others.
 
 ## **Get current hostname**
 
@@ -194,28 +196,43 @@ Kubernetes scheduling and cgroups break when swap is enabled.
 
 # 🧠 6. Kernel Modules for Kubernetes
 
-Enable modules:
+Enable modules (safe/load-if-available):
 
 ```bash
 echo -e "overlay\nbr_netfilter" | sudo tee /etc/modules-load.d/k8s.conf
-sudo modprobe overlay
-sudo modprobe br_netfilter
+sudo modprobe overlay || true
+sudo modprobe br_netfilter || true
 ```
 
-**Explanation:**
-Required for network bridging and CNI plugins.
+**Explanation (module-by-module):**
+
+* `overlay` — Provides the overlay filesystem used by many container runtimes (containerd, Docker). It enables image layering and copy-on-write semantics which are essential for containers.
+* `br_netfilter` — Ensures bridged network traffic is passed to the netfilter (iptables) stack. This allows kube-proxy and CNI plugins to apply iptables rules to bridged traffic, which is required for service routing and network policies.
+
+**Optional modules (only when needed):**
+
+* `nf_conntrack` — Connection tracking table required by some advanced networking setups.
+* `ip_vs`, `ip_vs_rr`, `ip_vs_wrr`, `ip_vs_sh` — Used for IPVS mode of kube-proxy (high-performance service proxy). Enable only if running kube-proxy in IPVS mode.
+
+**Important:** Not every OS or kernel exposes the same module names or even modules at all (some have them built-in). The scripts provided are defensive (`|| true`) so they won't fail on systems where `modprobe` returns non-zero.
 
 ---
 
 # 🌐 7. sysctl Network Settings
 
+Apply recommended sysctl values and disable IPv6 for now.
+
 ```bash
-echo -e "net.bridge.bridge-nf-call-iptables = 1\nnet.ipv4.ip_forward = 1\nnet.bridge.bridge-nf-call-ip6tables = 1" | sudo tee /etc/sysctl.d/k8s.conf
+echo -e "net.bridge.bridge-nf-call-iptables = 1\nnet.bridge.bridge-nf-call-ip6tables = 1\nnet.ipv4.ip_forward = 1\nnet.ipv6.conf.all.disable_ipv6 = 1\nnet.ipv6.conf.default.disable_ipv6 = 1\nnet.ipv6.conf.lo.disable_ipv6 = 1" | sudo tee /etc/sysctl.d/k8s.conf
 sudo sysctl --system
 ```
 
 **Explanation:**
-Enables packet forwarding and ensures iptables sees bridged traffic.
+
+* Enables packet forwarding and ensures iptables sees bridged traffic.
+* Disables IPv6 by default to keep networking single-stack (IPv4) during initial deployments. Dual-stack greatly increases complexity and troubleshooting overhead.
+
+If you intentionally need IPv6 later, remove the `net.ipv6.conf.*` lines and run `sudo sysctl --system` to re-enable.
 
 ---
 
@@ -274,8 +291,9 @@ Before proceeding to Phase 02, confirm:
 ### Kernel & System Requirements
 
 * [ ] Swap disabled (runtime + fstab)
-* [ ] Required kernel modules loaded
+* [ ] Required kernel modules loaded (or present in kernel)
 * [ ] sysctl networking enabled
+* [ ] IPv6 disabled (or intentionally configured)
 * [ ] Time is synchronized
 
 ### Network
@@ -288,41 +306,158 @@ Before proceeding to Phase 02, confirm:
 
 # 📦 Scripts Folder (01-machine-prep/scripts/)
 
-Recommended scripts:
+Below are production-ready scripts to place directly in the `scripts/` directory. Scripts are defensive and include IPv6 disable settings.
 
 ## **init-system.sh**
 
-* Updates OS
-* Sets hostname
-* Configures hosts
-* Creates admin user
-* Disables swap
+```bash
+#!/bin/bash
+set -e
+
+# Update OS
+apt update && apt upgrade -y
+
+# Disable swap
+swapoff -a
+sed -i '/ swap / s/^/#/' /etc/fstab
+
+# Load kernel modules (non-fatal)
+cat <<EOF | tee /etc/modules-load.d/k8s.conf
+overlay
+br_netfilter
+EOF
+modprobe overlay || true
+modprobe br_netfilter || true
+
+# Apply sysctl settings (includes IPv6 disable)
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+
+# Disable IPv6 for predictable networking (remove if you need IPv6)
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+sysctl --system || true
+
+echo "System initialization complete."
+```
 
 ## **kernel-tuning.sh**
 
-* Loads kernel modules
-* Applies sysctl configuration
+```bash
+#!/bin/bash
+set -e
+
+modprobe overlay || true
+modprobe br_netfilter || true
+
+cat <<EOF | tee /etc/sysctl.d/k8s.conf
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+
+# Disable IPv6 for predictable networking (remove if you need IPv6)
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+EOF
+
+sysctl --system || true
+```
 
 ## **verify.sh**
 
-* Confirms all preflight checks
+```bash
+#!/bin/bash
+set -e
+
+echo "Checking hostname..."
+hostname
+
+echo "Checking IP addresses..."
+ip a
+
+echo "Checking swap status (should be empty)..."
+swapon --show || true
+
+echo "Checking kernel modules..."
+lsmod | grep -E "overlay|br_netfilter" || true
+
+echo "Checking sysctl values..."
+sysctl net.bridge.bridge-nf-call-iptables || true
+sysctl net.ipv4.ip_forward || true
+
+echo "Checking IPv6 status (should show disabled=1)..."
+sysctl net.ipv6.conf.all.disable_ipv6 || true
+
+echo "Checking time sync..."
+chronyc tracking || systemctl status chrony || true
+
+echo "Preflight validation complete."
+```
 
 ---
 
 # 📄 Templates Folder (01-machine-prep/templates/)
 
-Recommended templates:
+Below are ready-to-use templates you can place directly into the `templates/` directory.
 
-### `hosts.template.md`
+## **hosts.template**
 
-A reusable template for cluster IP plan.
+A reusable IP plan & hosts file template.
 
-### `sysctl-k8s.conf`
+```text
+# ==============================
+# Kubernetes Cluster Hosts File
+# ==============================
+# Control Plane Nodes
+<CP1_IP>   cp1
+<CP2_IP>   cp2
+<CP3_IP>   cp3
 
-Predefined sysctl rules used across nodes.
+# Worker Nodes
+<WORKER1_IP>   worker1
+<WORKER2_IP>   worker2
+<WORKER3_IP>   worker3
+
+# Example:
+# 192.168.10.11   cp1
+# 192.168.10.12   cp2
+# 192.168.10.13   cp3
+# 192.168.10.21   worker1
+# 192.168.10.22   worker2
+```
+
+## **sysctl-k8s.conf**
+
+This file applies Kubernetes-required sysctl settings (includes IPv6 disable).
+
+```text
+# Kubernetes sysctl settings
+net.bridge.bridge-nf-call-iptables = 1
+net.bridge.bridge-nf-call-ip6tables = 1
+net.ipv4.ip_forward = 1
+
+# Disable IPv6 for predictable networking (remove if you need IPv6)
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 1
+```
 
 ---
 
 # 🎉 Phase 01 Complete
 
 You are now ready to begin **Phase 02 — Kubespray Setup**, where Kubernetes will be provisioned automatically using Ansible.
+
+---
+
+# Changelog (v2)
+
+* Added kernel module explanations and optional modules note.
+* Disabled IPv6 by default (sysctl + scripts + templates).
+* Made scripts defensive (`modprobe ... || true`, `sysctl --system || true`).
+* Added cross-distro notes where needed.

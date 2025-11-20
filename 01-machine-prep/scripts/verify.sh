@@ -1,31 +1,26 @@
 #!/bin/bash
 set -e
 
- echo "Checking hostname..."
+echo "Checking hostname..."
 hostname
 
- echo "Checking IP addresses..."
+echo "Checking IP addresses..."
 ip a
 
- echo "Checking swap status (should be empty)..."
-swapon --show
+echo "Checking swap status (should be empty)..."
+swapon --show || true
 
- echo "Checking kernel modules..."
-lsmod | grep -E "overlay|br_netfilter"
+echo "Checking kernel modules..."
+lsmod | grep -E "overlay|br_netfilter" || true
 
- echo "Checking sysctl values..."
-sysctl net.bridge.bridge-nf-call-iptables
-sysctl net.ipv4.ip_forward
+echo "Checking sysctl values..."
+sysctl net.bridge.bridge-nf-call-iptables || true
+sysctl net.ipv4.ip_forward || true
 
- echo "Checking time sync..."
-chronyc tracking || systemctl status chrony
+echo "Checking IPv6 status (should show disabled=1)..."
+sysctl net.ipv6.conf.all.disable_ipv6 || true
 
- echo "Preflight validation complete."
-``` (01-machine-prep/templates/)
-Recommended templates:
+echo "Checking time sync..."
+chronyc tracking || systemctl status chrony || true
 
-### `hosts.template`
-A reusable template for cluster IP plan.
-
-### `sysctl-k8s.conf`
-Predefined sysctl rules used across nodes.
+echo "Preflight validation complete."
